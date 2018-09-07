@@ -42,6 +42,7 @@ public:
         OptionalReduction();
         FunctionComposition();
         MapReduce();
+        AvoidingTemporaries();
     }
 
 private:
@@ -52,7 +53,7 @@ private:
     template<typename Container, typename Value, typename BinaryOp>
     static auto LeftFold(const Container& container, Value&& init, BinaryOp&& combine)
     {
-        return std::accumulate(std::begin(container), std::end(container),
+        return std::accumulate(std::cbegin(container), std::cend(container),
             std::forward<Value>(init), std::forward<BinaryOp>(combine));
     }
 
@@ -185,7 +186,28 @@ private:
     */
     static void AvoidingTemporaries()
     {
+        /*
+            The best way to avoid temporaries is to just take advantage of standard
+            argument passing practices.
 
+            1. Don't pass by value.
+            2. If templated, pass by universal reference and forward it where appropriate.
+            3. Pass by reference
+
+            For example:
+            std::accumulate(std::begin(), std::end(), init, combine);
+
+            Given that syntax of accumulate, the only things we can control are init and combine.
+                1. If you pass in an rvalue into init, then it will be moved in instead of copied.
+                2. Combine can be any callable object, and if it's something that has a lifetime associated with it,
+                   like a lambda or function object, then you can also forward that to prevent a copy from occurring.
+
+            Ultimately, we can only save 2 copies from happening by not passing init and combine by value.
+
+            This reiterates the guideline to not pass by value for expensive objects, and in the case of
+            stl algorithms, we can't control what happens behind the scene. We can only control what we
+            explicitly supply the method, and pass that by reference or rvalue. This excludes iterators.
+        */
     }
 
     /*
