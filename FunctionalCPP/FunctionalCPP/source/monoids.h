@@ -1,12 +1,16 @@
 #pragma once
 
+#include <assert.h>
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <functional>
+#include <future>
 #include <numeric>
 #include <string>
 #include <optional>
 #include <vector>
+#include <thread>
 
 /*
     Monoids are defined by the laws that classify them. There are three that
@@ -42,7 +46,7 @@ public:
         OptionalReduction();
         FunctionComposition();
         MapReduce();
-        AvoidingTemporaries();
+        Parallelization();
     }
 
 private:
@@ -56,6 +60,25 @@ private:
         return std::accumulate(std::cbegin(container), std::cend(container),
             std::forward<Value>(init), std::forward<BinaryOp>(combine));
     }
+
+    class Timer
+    {
+    public:
+
+        void Start()
+        {
+            previousTime = std::chrono::high_resolution_clock::now();
+        }
+
+        long long GetElapsed()
+        {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - previousTime).count();
+        }
+
+    private:
+
+        std::chrono::high_resolution_clock::time_point previousTime{};
+    };
 
 private:
 
@@ -210,6 +233,51 @@ private:
         */
     }
 
+private:
+
+    struct ExpensiveMonoid
+    {
+        int value;
+        int operator+(const int& rhs)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds{ 15 });
+            return value += rhs;
+        }
+    };
+
+    template<typename T>
+    std::vector<T> BuildMonoids(const unsigned int n)
+    {
+        std::vector<T> vecRet{};
+        vecRet.reserve(n);
+
+        for (auto i = 0; i < n; ++i)
+            vecRet.emplace_back(T{});
+
+        return vecRet;
+    }
+
+    template<typename Container, typename BinaryOp>
+    std::vector<BinaryOp> BuildTasks(const Container& container)
+    {
+        std::vector<BinaryOp> vecTasks{};
+
+        const int stepCount = container.size() / std::thread::hardware_concurrency();
+        auto begin = std::begin(container);
+
+        while (begin != std::end(container))
+        {
+            vecTasks.push_back([begin = begin, stepCount = stepCount]
+            {
+                return std::accumulate(begin, std::next(begin, stepCount), std::size_t{ 0 });
+            });
+
+            std::advance(begin, stepCount);
+        }
+
+        return vecTasks;
+    }
+
     /*
         This is an experiment at parallelizing the reduction process, since monoids
         are trivially parallelizable. This is because of their associativity and identity
@@ -217,7 +285,44 @@ private:
     */
     static void Parallelization()
     {
+        Timer timer{};
+        timer.Start();
 
+        // Build the container of values we're reducing
+        auto values = BuildMonoids(std::thread::hardware_concurrency() * 40'000'000);
+        std::cout << "Time to build the value container: "<< timer.GetElapsed() << "ms\n";
+
+        timer.Start();
+        {
+            // What the expected value is
+            auto expectedSum = std::accumulate(std::cbegin(values), std::cend(values), std::size_t{0});
+            std::cout << "Expected sum: " << expectedSum << "\n";
+            std::cout << "Time to reduce sequentially: " << timer.GetElapsed() << "ms\n";
+        }
+
+        // Prepare the container to be parallelized
+        auto vecTasks = BuildTasks(values);
+
+        timer.Start();
+        {
+            std::vector<std::future<size_t>> vecFutures;
+            for (const auto& task : vecTasks)
+                vecFutures.emplace_back(std::async(std::launch::async, task));
+
+            // Run the tasks in parallel
+            while (!std::all_of(std::begin(vecFutures), std::end(vecFutures),
+                [](std::future<size_t>& future) { return future.wait_for(std::chrono::seconds{ 0 }) == std::future_status::ready; }))
+            {}
+
+            auto parallelSum = std::accumulate(std::begin(vecFutures), std::end(vecFutures), std::size_t{0},
+                [](const std::size_t& init, std::future<std::size_t>& future)
+                {
+                    return init + future.get();
+                });
+
+            std::cout << "Parallel Sum: " << parallelSum << "\n";
+            std::cout << "Time to reduce asyncronously: " << timer.GetElapsed() << "ms\n";
+        }
     }
 };
 
