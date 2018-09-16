@@ -11,6 +11,10 @@
 #include <optional>
 #include <vector>
 #include <thread>
+#include <list>
+#include <execution>
+#include <fstream>
+#include <type_traits>
 
 /*
     Monoids are defined by the laws that classify them. There are three that
@@ -59,6 +63,60 @@ private:
     {
         return std::accumulate(std::cbegin(container), std::cend(container),
             std::forward<Value>(init), std::forward<BinaryOp>(combine));
+    }
+
+    /*
+        Creates a task that runs based on the given policy. This is a helper function
+        to ease making async tasks from arbitrary callable objects.
+    */
+    template<typename Fn, typename...Args>
+    static auto CreateTask(const std::launch policy, Fn&& fn, Args&&...args)
+    {
+        return std::future<std::invoke_result_t<Fn, Args...>>
+            { std::async(policy, std::forward<Fn>(fn), std::forward<Args>(args)...)};
+    }
+
+    /*
+        A divide and conquer algorithm that recursively subdivides the range [begin, end)
+        until it hits a load factor, then reduces each sub problem on the way out of recursion.
+        The sums are computed sequentially, but as we work our way out of recursion, we
+        reduce each side of the split asynchronously.
+
+        There are some things that can be done to improve the algorithm:
+
+        1. Change how the load factor is determined, as std::distance produces
+            different performance depending on the passed in iterator types.
+
+        2. Mimic c++17 execution policies, which would allow the reduction of a container
+            that requires each reduction process to not be interleaved
+
+        3. Investigate the inconsistent performance. It performs as expected,
+            but could be optimized to perform better. (I believe this may be due
+            to using task-based programming. If we could control the threads, then
+            we may be able to even out the overall performance)
+    */
+    template<typename Iterator, typename Value, typename BinaryOp>
+    static auto Reduce(Iterator begin, Iterator end, Value&& init, BinaryOp&& combine)
+    {
+        // Obtains the distance between begin and end in the first call to reduce
+        static std::ptrdiff_t load = std::distance(begin, end) / std::thread::hardware_concurrency();
+
+        // Constant with random access iterators, linear otherwise
+        if (std::distance(begin, end) <= load)
+            return std::accumulate(begin, end, std::forward<Value>(init), std::forward<BinaryOp>(combine));
+
+        // Recursively reduce the left and right hand sides asynchronously. If this isn't done
+        // in separate threads, then the algorithm is sequential.
+        auto middle = std::next(begin, std::distance(begin, end) / 2);
+        auto lhsTask = CreateTask(std::launch::async, Reduce<Iterator, Value, BinaryOp>,
+            begin, middle, std::forward<Value>(init), std::forward<BinaryOp>(combine));
+
+        auto rhsTask = CreateTask(std::launch::async, Reduce<Iterator, Value, BinaryOp>,
+            middle, end, std::forward<Value>(init), std::forward<BinaryOp>(combine));
+
+        // Left fold the results, but they could really be combined in any way.
+        // This is an out of order reduction, and hence isn't a left or right fold.
+        return combine(combine(init, lhsTask.get()), rhsTask.get());
     }
 
     class Timer
@@ -233,95 +291,46 @@ private:
         */
     }
 
-private:
-
-    struct ExpensiveMonoid
-    {
-        int value;
-        int operator+(const int& rhs)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds{ 15 });
-            return value += rhs;
-        }
-    };
-
-    template<typename T>
-    std::vector<T> BuildMonoids(const unsigned int n)
-    {
-        std::vector<T> vecRet{};
-        vecRet.reserve(n);
-
-        for (auto i = 0; i < n; ++i)
-            vecRet.emplace_back(T{});
-
-        return vecRet;
-    }
-
-    template<typename Container, typename BinaryOp>
-    std::vector<BinaryOp> BuildTasks(const Container& container)
-    {
-        std::vector<BinaryOp> vecTasks{};
-
-        const int stepCount = container.size() / std::thread::hardware_concurrency();
-        auto begin = std::begin(container);
-
-        while (begin != std::end(container))
-        {
-            vecTasks.push_back([begin = begin, stepCount = stepCount]
-            {
-                return std::accumulate(begin, std::next(begin, stepCount), std::size_t{ 0 });
-            });
-
-            std::advance(begin, stepCount);
-        }
-
-        return vecTasks;
-    }
-
     /*
         This is an experiment at parallelizing the reduction process, since monoids
-        are trivially parallelizable. This is because of their associativity and identity
-        properties, but also because combine is a pure function.
+        are trivially parallelizable. The point is to show that we can reduce, not left or right fold,
+        a container of monoids, since they are associative and have an identity.
     */
     static void Parallelization()
     {
         Timer timer{};
-        timer.Start();
 
-        // Build the container of values we're reducing
-        auto values = BuildMonoids(std::thread::hardware_concurrency() * 40'000'000);
-        std::cout << "Time to build the value container: "<< timer.GetElapsed() << "ms\n";
+        std::vector<double> values{};
+        values.reserve(10'000'000);
 
-        timer.Start();
+        for (auto i = 0; i < values.capacity(); ++i)
+            values.emplace_back(1.0);
+
+        std::ofstream logger{ "D:\\execution_times.csv", std::ios::out };
+        logger << "Iteration,Custom Reduce,C++17 Reduce,Sequential Reduce\n";
+
+        for (auto i = 0; i < 1000; ++i)
         {
-            // What the expected value is
-            auto expectedSum = std::accumulate(std::cbegin(values), std::cend(values), std::size_t{0});
-            std::cout << "Expected sum: " << expectedSum << "\n";
-            std::cout << "Time to reduce sequentially: " << timer.GetElapsed() << "ms\n";
-        }
-
-        // Prepare the container to be parallelized
-        auto vecTasks = BuildTasks(values);
-
-        timer.Start();
-        {
-            std::vector<std::future<size_t>> vecFutures;
-            for (const auto& task : vecTasks)
-                vecFutures.emplace_back(std::async(std::launch::async, task));
-
-            // Run the tasks in parallel
-            while (!std::all_of(std::begin(vecFutures), std::end(vecFutures),
-                [](std::future<size_t>& future) { return future.wait_for(std::chrono::seconds{ 0 }) == std::future_status::ready; }))
-            {}
-
-            auto parallelSum = std::accumulate(std::begin(vecFutures), std::end(vecFutures), std::size_t{0},
-                [](const std::size_t& init, std::future<std::size_t>& future)
-                {
-                    return init + future.get();
-                });
-
-            std::cout << "Parallel Sum: " << parallelSum << "\n";
-            std::cout << "Time to reduce asyncronously: " << timer.GetElapsed() << "ms\n";
+            logger << i + 1 << ",";
+        
+            // The custom-rolled reduce. This performs as we'd expect, which is to be significantly faster
+            // than the sequential version. It falls behind the standard implementation of reduce, however.
+            timer.Start();
+            auto a = Reduce(std::begin(values), std::end(values), 0.0, std::plus<>());
+            logger << timer.GetElapsed() << ",";
+            std::cout << a;
+        
+            // A baseline for asynchronous reduction. If you have Cpp17, use this instead of a custom-rolled version.
+            timer.Start();
+            auto b = std::reduce(std::execution::par_unseq, std::begin(values), std::end(values), 0.0, std::plus<>());
+            logger << timer.GetElapsed() << ",";
+            std::cout << b;
+        
+            // A baseline for sequential reduction.
+            timer.Start();
+            auto c = std::accumulate(std::begin(values), std::end(values), 0.0, std::plus<>());
+            logger << timer.GetElapsed() << "\n";
+            std::cout << c;
         }
     }
 };
